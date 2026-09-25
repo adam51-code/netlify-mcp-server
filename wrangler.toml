@@ -1,0 +1,7 @@
+name = "netlify-mcp-server"
+main = "src/index.js"
+compatibility_date = "2025-01-15"
+
+# Secrets (do not commit values):
+#   npx wrangler secret put NETLIFY_TOKEN   <- Netlify personal access token
+#   npx wrangler secret put MCP_AUTH_TOKEN  <- shared MCP bearer token
