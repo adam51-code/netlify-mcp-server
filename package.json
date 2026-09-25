@@ -1,0 +1,10 @@
+{
+  "name": "netlify-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server wrapping the Netlify API: publish HTML pages to live public URLs for screenshot QA",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy"
+  }
+}
