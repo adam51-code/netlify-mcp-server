@@ -10,7 +10,8 @@ const TOOLS = {
       html: { type: "string", description: "The full HTML document to publish", required: true },
       path: { type: "string", description: "File path to publish at (default /index.html)", required: false },
       site_id: { type: "string", description: "Existing Netlify site ID to redeploy. Omit to create a new site.", required: false },
-      name: { type: "string", description: "Site name for a new site (default: auto-generated ndib-clone-xxxx)", required: false }
+      name: { type: "string", description: "Site name for a new site (default: auto-generated ndib-clone-xxxx)", required: false },
+      replace_all_files: { type: "boolean", description: "Default false: all other files already on the site are kept and only this file changes. Set true ONLY to wipe the site down to this single file.", required: false }
     }
   },
   netlify_api__publish_from_url: {
@@ -19,12 +20,28 @@ const TOOLS = {
       source_url: { type: "string", description: "Public URL whose HTML to fetch and publish", required: true },
       replacements: { type: "string", description: "Optional JSON array string of {\"find\":\"...\",\"replace\":\"...\"} transforms applied to the fetched HTML before deploy. Each find is replaced globally. Response reports how many times each matched.", required: false },
       site_id: { type: "string", description: "Existing Netlify site ID to redeploy. Omit to create a new site.", required: false },
-      name: { type: "string", description: "Site name for a new site (default: auto-generated ndib-clone-xxxx)", required: false }
+      name: { type: "string", description: "Site name for a new site (default: auto-generated ndib-clone-xxxx)", required: false },
+      path: { type: "string", description: "File path to publish the HTML at (default /index.html)", required: false },
+      replace_all_files: { type: "boolean", description: "Default false: all other files already on the site are kept and only this file changes. Set true ONLY to wipe the site down to this single file.", required: false }
     }
   },
   netlify_api__list_sites: {
     description: "List Netlify sites on the account with their ID, name, live URL, and last update time. Use to find a site_id for redeploys.",
     params: {}
+  },
+  netlify_api__list_deploys: {
+    description: "List recent deploys for a Netlify site (newest first) with deploy ID, state, created/published time, title, context, and permalink. Use to find a known-good deploy to roll back to. The currently published deploy is flagged is_published.",
+    params: {
+      site_id: { type: "string", description: "Netlify site ID", required: true },
+      limit: { type: "number", description: "How many deploys to return (default 20, max 100)", required: false }
+    }
+  },
+  netlify_api__restore_deploy: {
+    description: "Roll a Netlify site back by publishing a previous deploy (same as 'Publish deploy' in the Netlify UI). Instant, no rebuild. Use list_deploys first to pick the deploy_id.",
+    params: {
+      site_id: { type: "string", description: "Netlify site ID", required: true },
+      deploy_id: { type: "string", description: "Deploy ID to publish", required: true }
+    }
   }
 };
 
@@ -61,9 +78,30 @@ async function ensureSite(env, siteId, name) {
   return await nf(env, "POST", "/sites", { name: siteName });
 }
 
-async function deployFiles(env, site, files) {
+async function existingFileDigests(env, siteId) {
+  // Every file in the currently published deploy, as { path: sha }.
+  var out = {};
+  for (var page = 1; page <= 500; page++) {
+    var list = await nf(env, "GET", "/sites/" + siteId + "/files?per_page=100&page=" + page);
+    if (!Array.isArray(list) || list.length === 0) break;
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
+      var p = f.path || f.id;
+      if (p && f.sha) out[p.charAt(0) === "/" ? p : "/" + p] = f.sha;
+    }
+    if (list.length < 100) break;
+  }
+  return out;
+}
+
+async function deployFiles(env, site, files, keepExisting) {
   // files: { "/index.html": "<html>..." }
   var digests = {};
+  var kept = 0;
+  if (keepExisting) {
+    digests = await existingFileDigests(env, site.id);
+    kept = Object.keys(digests).length;
+  }
   for (var path in files) {
     digests[path] = await sha1Hex(files[path]);
   }
@@ -91,6 +129,8 @@ async function deployFiles(env, site, files) {
     deploy_id: deploy.id,
     state: state,
     uploaded: uploaded,
+    files_in_deploy: Object.keys(digests).length,
+    existing_files_kept: kept,
     url: site.ssl_url || site.url,
     deploy_url: deploy.deploy_ssl_url || deploy.ssl_url || null
   };
@@ -102,7 +142,7 @@ async function publishPage(env, args) {
   var site = await ensureSite(env, args.site_id, args.name);
   var files = {};
   files[path] = args.html;
-  var result = await deployFiles(env, site, files);
+  var result = await deployFiles(env, site, files, !!args.site_id && args.replace_all_files !== true);
   result.site_id = site.id;
   result.site_name = site.name;
   result.html_length = args.html.length;
@@ -136,7 +176,11 @@ async function publishFromUrl(env, args) {
   }
 
   var site = await ensureSite(env, args.site_id, args.name);
-  var result = await deployFiles(env, site, { "/index.html": html });
+  var outPath = args.path || "/index.html";
+  if (outPath.charAt(0) !== "/") outPath = "/" + outPath;
+  var outFiles = {};
+  outFiles[outPath] = html;
+  var result = await deployFiles(env, site, outFiles, !!args.site_id && args.replace_all_files !== true);
   result.site_id = site.id;
   result.site_name = site.name;
   result.source_url = args.source_url;
@@ -155,11 +199,48 @@ async function listSites(env) {
   };
 }
 
+async function listDeploys(env, args) {
+  var limit = Math.min(Math.max(parseInt(args.limit || 20, 10) || 20, 1), 100);
+  var site = await nf(env, "GET", "/sites/" + args.site_id);
+  var deploys = await nf(env, "GET", "/sites/" + args.site_id + "/deploys?per_page=" + limit + "&page=1");
+  return {
+    site_id: site.id,
+    site_name: site.name,
+    published_deploy_id: site.published_deploy ? site.published_deploy.id : null,
+    deploys: deploys.slice(0, limit).map(function(d) {
+      return {
+        id: d.id,
+        state: d.state,
+        is_published: !!(site.published_deploy && site.published_deploy.id === d.id),
+        created_at: d.created_at,
+        published_at: d.published_at,
+        title: d.title,
+        context: d.context,
+        branch: d.branch,
+        permalink: d.links && d.links.permalink ? d.links.permalink : (d.deploy_ssl_url || d.deploy_url)
+      };
+    })
+  };
+}
+
+async function restoreDeploy(env, args) {
+  var d = await nf(env, "POST", "/sites/" + args.site_id + "/deploys/" + args.deploy_id + "/restore");
+  var site = await nf(env, "GET", "/sites/" + args.site_id);
+  return {
+    restored_deploy_id: d.id,
+    state: d.state,
+    now_published_deploy_id: site.published_deploy ? site.published_deploy.id : null,
+    url: site.ssl_url || site.url
+  };
+}
+
 async function executeTool(env, name, args) {
   switch (name) {
     case "netlify_api__publish_page": return await publishPage(env, args);
     case "netlify_api__publish_from_url": return await publishFromUrl(env, args);
     case "netlify_api__list_sites": return await listSites(env);
+    case "netlify_api__list_deploys": return await listDeploys(env, args);
+    case "netlify_api__restore_deploy": return await restoreDeploy(env, args);
     default: throw new Error("Unknown tool: " + name);
   }
 }
