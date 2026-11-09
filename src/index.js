@@ -31,6 +31,7 @@ const TOOLS = {
       site_id: { type: "string", description: "Netlify site ID", required: true },
       edits: { type: "string", description: "Optional JSON array string of {\"path\":\"/index.html\",\"find\":\"...\",\"replace\":\"...\",\"count\":1}. path is the deployed file path. find must match exactly count times (default 1) or nothing is deployed.", required: false },
       new_files: { type: "string", description: "Optional JSON array string of {\"path\":\"/img/logo.svg\",\"source_url\":\"https://...\"} or {\"path\":\"/x.txt\",\"content\":\"...\"}. Fetched server-side, so binaries never pass through chat.", required: false },
+      remove: { type: "string", description: "Optional JSON array string of things to drop from the new deploy: {\"path\":\"/old.html\"} removes a file, {\"path\":\"/.netlify/internal/*\"} removes every file under a prefix (edge functions live there), {\"function\":\"name\"} drops a serverless function and its schedule. Each must match something or nothing is deployed. Entries in new_files with \"delete\":true are treated the same way.", required: false },
       draft: { type: "boolean", description: "Default true: create a draft preview only. Set false to publish to production immediately.", required: false },
       message: { type: "string", description: "Deploy message shown in Netlify", required: false }
     }
@@ -228,7 +229,9 @@ async function editLiveFiles(env, args) {
 
   var edits = parseJsonArray(args.edits, "edits");
   var newFiles = parseJsonArray(args.new_files, "new_files");
-  if (!edits.length && !newFiles.length) throw new Error("Nothing to do: pass edits and/or new_files");
+  var removals = parseJsonArray(args.remove, "remove");
+  newFiles = newFiles.filter(function(x) { if (x && x.delete) { removals.push(x); return false; } return true; });
+  if (!edits.length && !newFiles.length && !removals.length) throw new Error("Nothing to do: pass edits, new_files and/or remove");
 
   // 1. Fetch and edit text files from the published deploy (server-side).
   var changed = {};
@@ -282,16 +285,46 @@ async function editLiveFiles(env, args) {
   var digests = await existingFileDigests(env, site.id);
   var keptCount = Object.keys(digests).length;
   var internalFiles = Object.keys(digests).filter(function(k) { return k.indexOf("/.netlify/") === 0; });
+  var removedReport = [];
+  var removeFns = {};
+  var avail = pub.available_functions || [];
+  for (var ri = 0; ri < removals.length; ri++) {
+    var rm = removals[ri];
+    if (rm.function) {
+      var hit = avail.some(function(f) { return f.n === rm.function; });
+      if (!hit) { problems.push("No function named " + rm.function + " on the published deploy"); continue; }
+      removeFns[rm.function] = true;
+      removedReport.push({ function: rm.function });
+    } else if (rm.path) {
+      var rp = normPath(rm.path);
+      var gone = [];
+      if (rp.slice(-1) === "*") {
+        var pre = rp.slice(0, -1);
+        Object.keys(digests).forEach(function(k) { if (k.indexOf(pre) === 0) gone.push(k); });
+      } else if (digests[rp]) {
+        gone.push(rp);
+      }
+      if (!gone.length) { problems.push("No file matches " + rp + " on the published deploy"); continue; }
+      gone.forEach(function(k) { delete digests[k]; });
+      removedReport.push({ path: rp, files_removed: gone });
+    } else {
+      problems.push("remove entries need path or function");
+    }
+  }
+  if (problems.length) {
+    return { deployed: false, reason: "Nothing deployed because of the problems below. Live site untouched.", problems: problems, removed: removedReport, netlify_internal_files: internalFiles };
+  }
   for (var cp in changed) digests[cp] = await sha1Hex(changed[cp]);
 
   var body = { files: digests, draft: args.draft !== false };
   var fnNames = [];
-  var avail = pub.available_functions || [];
-  if (avail.length) {
-    body.functions = {};
-    avail.forEach(function(f) { if (f.n && f.d) { body.functions[f.n] = f.d; fnNames.push(f.n); } });
+  // Always send a functions map so removed functions are actually dropped.
+  body.functions = {};
+  avail.forEach(function(f) { if (f.n && f.d && !removeFns[f.n]) { body.functions[f.n] = f.d; fnNames.push(f.n); } });
+  if (Array.isArray(pub.function_schedules)) {
+    var keptSchedules = pub.function_schedules.filter(function(sc) { return !removeFns[sc.name]; });
+    if (keptSchedules.length) body.function_schedules = keptSchedules;
   }
-  if (Array.isArray(pub.function_schedules) && pub.function_schedules.length) body.function_schedules = pub.function_schedules;
 
   var qs = args.message ? "?title=" + encodeURIComponent(args.message) : "";
   var deploy = await nf(env, "POST", "/sites/" + site.id + "/deploys" + qs, body);
@@ -319,7 +352,8 @@ async function editLiveFiles(env, args) {
     copied_from_deploy: pub.id,
     files_in_deploy: Object.keys(digests).length,
     existing_files_kept: keptCount,
-    netlify_internal_files_kept: internalFiles.length,
+    netlify_internal_files_kept: Object.keys(digests).filter(function(k) { return k.indexOf("/.netlify/") === 0; }),
+    removed: removedReport,
     functions_carried: fnNames,
     function_schedules_carried: body.function_schedules || [],
     functions_still_required: requiredFunctions,
