@@ -1,11 +1,11 @@
-// netlify-mcp-server: publish HTML to live Netlify URLs for pixel-perfect QA.
+// netlify-mcp-server: publish and safely edit Netlify sites from ClickUp Brain.
 // Zero dependencies. Netlify personal access token via `wrangler secret put NETLIFY_TOKEN`.
 
 const API = "https://api.netlify.com/api/v1";
 
 const TOOLS = {
   netlify_api__publish_page: {
-    description: "Publish HTML to Netlify and return the live public URL. Pass site_id to update an existing site (same URL), omit it to create a new site. Use for hosting clone HTML so it can be screenshot-compared against the original page.",
+    description: "Publish HTML to Netlify and return the live public URL. Pass site_id to update an existing site (same URL), omit it to create a new site. Use for hosting clone HTML so it can be screenshot-compared against the original page. NOTE: does not carry over functions; for real production sites use edit_live_files instead.",
     params: {
       html: { type: "string", description: "The full HTML document to publish", required: true },
       path: { type: "string", description: "File path to publish at (default /index.html)", required: false },
@@ -15,7 +15,7 @@ const TOOLS = {
     }
   },
   netlify_api__publish_from_url: {
-    description: "Fetch a public URL's HTML server-side (content never passes through the conversation), optionally apply find/replace transforms, deploy to Netlify, and return the live URL. Ideal for publishing the lp-extract /clone endpoint output and iterating with small replacements without downloading the full HTML.",
+    description: "Fetch a public URL's HTML server-side (content never passes through the conversation), optionally apply find/replace transforms, deploy to Netlify, and return the live URL. Ideal for publishing the lp-extract /clone endpoint output and iterating with small replacements without downloading the full HTML. NOTE: does not carry over functions; for real production sites use edit_live_files instead.",
     params: {
       source_url: { type: "string", description: "Public URL whose HTML to fetch and publish", required: true },
       replacements: { type: "string", description: "Optional JSON array string of {\"find\":\"...\",\"replace\":\"...\"} transforms applied to the fetched HTML before deploy. Each find is replaced globally. Response reports how many times each matched.", required: false },
@@ -23,6 +23,16 @@ const TOOLS = {
       name: { type: "string", description: "Site name for a new site (default: auto-generated ndib-clone-xxxx)", required: false },
       path: { type: "string", description: "File path to publish the HTML at (default /index.html)", required: false },
       replace_all_files: { type: "boolean", description: "Default false: all other files already on the site are kept and only this file changes. Set true ONLY to wipe the site down to this single file.", required: false }
+    }
+  },
+  netlify_api__edit_live_files: {
+    description: "Safely change a few files on an existing production Netlify site without its source folder. Copies the currently published deploy (every file, plus its functions and function schedules), applies exact find/replace edits to files fetched server-side from that deploy, adds or overwrites files from a URL (binary-safe: images, SVGs, fonts) or inline text, and creates a new deploy. Defaults to a DRAFT preview that does not touch the live site; publish it afterwards with restore_deploy. Refuses to deploy if any find string does not match its expected count.",
+    params: {
+      site_id: { type: "string", description: "Netlify site ID", required: true },
+      edits: { type: "string", description: "Optional JSON array string of {\"path\":\"/index.html\",\"find\":\"...\",\"replace\":\"...\",\"count\":1}. path is the deployed file path. find must match exactly count times (default 1) or nothing is deployed.", required: false },
+      new_files: { type: "string", description: "Optional JSON array string of {\"path\":\"/img/logo.svg\",\"source_url\":\"https://...\"} or {\"path\":\"/x.txt\",\"content\":\"...\"}. Fetched server-side, so binaries never pass through chat.", required: false },
+      draft: { type: "boolean", description: "Default true: create a draft preview only. Set false to publish to production immediately.", required: false },
+      message: { type: "string", description: "Deploy message shown in Netlify", required: false }
     }
   },
   netlify_api__list_sites: {
@@ -37,7 +47,7 @@ const TOOLS = {
     }
   },
   netlify_api__restore_deploy: {
-    description: "Roll a Netlify site back by publishing a previous deploy (same as 'Publish deploy' in the Netlify UI). Instant, no rebuild. Use list_deploys first to pick the deploy_id.",
+    description: "Publish a specific deploy to production: roll back to a previous deploy, or publish a draft preview made by edit_live_files (same as 'Publish deploy' in the Netlify UI). Instant, no rebuild. Use list_deploys first to pick the deploy_id.",
     params: {
       site_id: { type: "string", description: "Netlify site ID", required: true },
       deploy_id: { type: "string", description: "Deploy ID to publish", required: true }
@@ -63,8 +73,8 @@ async function nf(env, method, path, body, rawBody) {
   return ct.indexOf("json") >= 0 ? resp.json() : resp.text();
 }
 
-async function sha1Hex(text) {
-  var data = new TextEncoder().encode(text);
+async function sha1Hex(content) {
+  var data = typeof content === "string" ? new TextEncoder().encode(content) : content;
   var hash = await crypto.subtle.digest("SHA-1", data);
   return Array.from(new Uint8Array(hash)).map(function(b) { return b.toString(16).padStart(2, "0"); }).join("");
 }
@@ -94,6 +104,20 @@ async function existingFileDigests(env, siteId) {
   return out;
 }
 
+function encodePath(path) {
+  return path.split("/").map(encodeURIComponent).join("/").replace(/^\//, "");
+}
+
+async function waitForDeploy(env, deployId, tries) {
+  var d = null;
+  for (var i = 0; i < tries; i++) {
+    d = await nf(env, "GET", "/deploys/" + deployId);
+    if (d.state === "ready" || d.state === "error") return d;
+    await new Promise(function(r) { setTimeout(r, 1500); });
+  }
+  return d;
+}
+
 async function deployFiles(env, site, files, keepExisting) {
   // files: { "/index.html": "<html>..." }
   var digests = {};
@@ -111,23 +135,16 @@ async function deployFiles(env, site, files, keepExisting) {
   var uploaded = [];
   for (var path in files) {
     if (required.indexOf(digests[path]) >= 0) {
-      var encoded = path.split("/").map(encodeURIComponent).join("/").replace(/^\//, "");
-      await nf(env, "PUT", "/deploys/" + deploy.id + "/files/" + encoded, undefined, files[path]);
+      await nf(env, "PUT", "/deploys/" + deploy.id + "/files/" + encodePath(path), undefined, files[path]);
       uploaded.push(path);
     }
   }
 
-  // Poll until ready (max ~20s)
-  var state = deploy.state;
-  for (var i = 0; i < 20 && state !== "ready" && state !== "error"; i++) {
-    await new Promise(function(r) { setTimeout(r, 1000); });
-    var d = await nf(env, "GET", "/deploys/" + deploy.id);
-    state = d.state;
-  }
+  var d = await waitForDeploy(env, deploy.id, 12);
 
   return {
     deploy_id: deploy.id,
-    state: state,
+    state: d ? d.state : deploy.state,
     uploaded: uploaded,
     files_in_deploy: Object.keys(digests).length,
     existing_files_kept: kept,
@@ -189,6 +206,130 @@ async function publishFromUrl(env, args) {
   return result;
 }
 
+function parseJsonArray(value, label) {
+  if (!value) return [];
+  var arr;
+  try { arr = typeof value === "string" ? JSON.parse(value) : value; } catch (e) { throw new Error(label + " must be a JSON array string: " + e.message); }
+  if (!Array.isArray(arr)) throw new Error(label + " must be a JSON array");
+  return arr;
+}
+
+function normPath(p) {
+  p = String(p || "");
+  return p.charAt(0) === "/" ? p : "/" + p;
+}
+
+async function editLiveFiles(env, args) {
+  var site = await nf(env, "GET", "/sites/" + args.site_id);
+  if (!site.published_deploy || !site.published_deploy.id) throw new Error("Site has no published deploy to copy");
+  var pub = await nf(env, "GET", "/deploys/" + site.published_deploy.id);
+  var base = (pub.links && pub.links.permalink) || ("https://" + pub.id + "--" + site.name + ".netlify.app");
+  base = base.replace(/\/$/, "");
+
+  var edits = parseJsonArray(args.edits, "edits");
+  var newFiles = parseJsonArray(args.new_files, "new_files");
+  if (!edits.length && !newFiles.length) throw new Error("Nothing to do: pass edits and/or new_files");
+
+  // 1. Fetch and edit text files from the published deploy (server-side).
+  var changed = {};
+  var editReport = [];
+  var problems = [];
+  var byPath = {};
+  edits.forEach(function(e) { var p = normPath(e.path); (byPath[p] = byPath[p] || []).push(e); });
+  for (var p in byPath) {
+    var urlPath = p.replace(/index\.html$/, "");
+    var r = await fetch(base + urlPath, { redirect: "follow" });
+    if (!r.ok) { problems.push("Could not read " + p + " from published deploy (status " + r.status + ")"); continue; }
+    var text = await r.text();
+    var list = byPath[p];
+    for (var i = 0; i < list.length; i++) {
+      var find = String(list[i].find || "");
+      var replace = String(list[i].replace == null ? "" : list[i].replace);
+      var expected = list[i].count == null ? 1 : Number(list[i].count);
+      var matched = find ? text.split(find).length - 1 : 0;
+      editReport.push({ path: p, find: find.substring(0, 100), expected: expected, matched: matched });
+      if (!find || matched !== expected) { problems.push("Edit on " + p + " matched " + matched + "x, expected " + expected + "x: " + find.substring(0, 80)); continue; }
+      text = text.split(find).join(replace);
+    }
+    changed[p] = text;
+  }
+
+  // 2. Fetch new/overwritten files (binary-safe).
+  var newReport = [];
+  for (var j = 0; j < newFiles.length; j++) {
+    var nfile = newFiles[j];
+    var np = normPath(nfile.path);
+    if (nfile.source_url) {
+      var fr = await fetch(nfile.source_url, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" } });
+      if (!fr.ok) { problems.push("Could not fetch " + nfile.source_url + " (status " + fr.status + ")"); continue; }
+      var buf = new Uint8Array(await fr.arrayBuffer());
+      if (!buf.length) { problems.push("Empty file from " + nfile.source_url); continue; }
+      changed[np] = buf;
+      newReport.push({ path: np, bytes: buf.length, content_type: fr.headers.get("content-type") });
+    } else if (typeof nfile.content === "string") {
+      changed[np] = nfile.content;
+      newReport.push({ path: np, bytes: nfile.content.length });
+    } else {
+      problems.push("new_files entry for " + np + " needs source_url or content");
+    }
+  }
+
+  if (problems.length) {
+    return { deployed: false, reason: "Nothing deployed because of the problems below. Live site untouched.", problems: problems, edits: editReport, new_files: newReport };
+  }
+
+  // 3. Copy the published deploy: all file digests + functions + schedules.
+  var digests = await existingFileDigests(env, site.id);
+  var keptCount = Object.keys(digests).length;
+  var internalFiles = Object.keys(digests).filter(function(k) { return k.indexOf("/.netlify/") === 0; });
+  for (var cp in changed) digests[cp] = await sha1Hex(changed[cp]);
+
+  var body = { files: digests, draft: args.draft !== false };
+  var fnNames = [];
+  var avail = pub.available_functions || [];
+  if (avail.length) {
+    body.functions = {};
+    avail.forEach(function(f) { if (f.n && f.d) { body.functions[f.n] = f.d; fnNames.push(f.n); } });
+  }
+  if (Array.isArray(pub.function_schedules) && pub.function_schedules.length) body.function_schedules = pub.function_schedules;
+
+  var qs = args.message ? "?title=" + encodeURIComponent(args.message) : "";
+  var deploy = await nf(env, "POST", "/sites/" + site.id + "/deploys" + qs, body);
+
+  var required = deploy.required || [];
+  var uploaded = [];
+  for (var up in changed) {
+    if (required.indexOf(digests[up]) >= 0) {
+      await nf(env, "PUT", "/deploys/" + deploy.id + "/files/" + encodePath(up), undefined, changed[up]);
+      uploaded.push(up);
+    }
+  }
+  var requiredFunctions = deploy.required_functions || [];
+
+  var d = await waitForDeploy(env, deploy.id, 12);
+  var previewUrl = (d && (d.links && d.links.permalink)) || ("https://" + deploy.id + "--" + site.name + ".netlify.app");
+
+  return {
+    deployed: true,
+    draft: body.draft,
+    deploy_id: deploy.id,
+    state: d ? d.state : deploy.state,
+    preview_url: previewUrl,
+    live_url: site.ssl_url || site.url,
+    copied_from_deploy: pub.id,
+    files_in_deploy: Object.keys(digests).length,
+    existing_files_kept: keptCount,
+    netlify_internal_files_kept: internalFiles.length,
+    functions_carried: fnNames,
+    function_schedules_carried: body.function_schedules || [],
+    functions_still_required: requiredFunctions,
+    uploaded: uploaded,
+    edits: editReport,
+    new_files: newReport,
+    next_step: body.draft ? "Check preview_url, then publish with restore_deploy using this deploy_id." : "Published to production."
+  };
+}
+
 async function listSites(env) {
   var sites = await nf(env, "GET", "/sites");
   return {
@@ -217,6 +358,7 @@ async function listDeploys(env, args) {
         title: d.title,
         context: d.context,
         branch: d.branch,
+        functions: (d.available_functions || []).map(function(f) { return f.n; }),
         permalink: d.links && d.links.permalink ? d.links.permalink : (d.deploy_ssl_url || d.deploy_url)
       };
     })
@@ -238,6 +380,7 @@ async function executeTool(env, name, args) {
   switch (name) {
     case "netlify_api__publish_page": return await publishPage(env, args);
     case "netlify_api__publish_from_url": return await publishFromUrl(env, args);
+    case "netlify_api__edit_live_files": return await editLiveFiles(env, args);
     case "netlify_api__list_sites": return await listSites(env);
     case "netlify_api__list_deploys": return await listDeploys(env, args);
     case "netlify_api__restore_deploy": return await restoreDeploy(env, args);
@@ -250,7 +393,7 @@ function jr(obj) { return new Response(JSON.stringify(obj), { headers: { "Conten
 
 async function handleRpc(request, env) {
   var body = await request.json(), method = body.method, params = body.params, rpcId = body.id;
-  if (method === "initialize") return jr({ jsonrpc: "2.0", id: rpcId, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "netlify-mcp-server", version: "1.0.0" } } });
+  if (method === "initialize") return jr({ jsonrpc: "2.0", id: rpcId, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "netlify-mcp-server", version: "1.1.0" } } });
   if (method === "notifications/initialized") return jr({ jsonrpc: "2.0", id: rpcId, result: {} });
   if (method === "tools/list") { var tools = Object.keys(TOOLS).map(function(n) { return buildToolSchema(n, TOOLS[n]); }); return jr({ jsonrpc: "2.0", id: rpcId, result: { tools: tools } }); }
   if (method === "tools/call") { var tn = params && params.name, ta = (params && params.arguments) || {}; try { var result = await executeTool(env, tn, ta); return jr({ jsonrpc: "2.0", id: rpcId, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } }); } catch (e) { return jr({ jsonrpc: "2.0", id: rpcId, result: { content: [{ type: "text", text: "Error: " + e.message }], isError: true } }); } }
